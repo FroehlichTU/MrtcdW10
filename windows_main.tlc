@@ -1,0 +1,505 @@
+%% ==============================================================================
+%% 
+%% 
+%% 
+%%
+%% Abstract:
+%%   Example main for bare board target (multirate model)
+%%
+%% Copyright 1994-2013 The MathWorks, Inc.
+%%
+%selectfile NULL_FILE
+
+	/* ************************* DisableGenerateExampleMain ********************** */
+%function DisableGenerateExampleMain() void
+  
+  %if GenerateSampleERTMain
+    %assign ::CompiledModel.GenerateSampleERTMain = TLC_FALSE
+    %warning Overriding example ert_main.c!
+  %endif
+
+%endfunction
+	/* *************************************************************************** */
+
+%assign ::tid01Eq = LibGetTID01EQ()
+
+%function generateDeclarations() Output
+
+
+	/* ******************************* Includes ********************************** */
+	// Multirate - Multitasking case main file
+
+	#include <stdio.h>                     // This ert_main.c example uses printf/fflush
+	#include <signal.h>
+	#include <stdlib.h>
+	#include <stdbool.h>
+	#include <unistd.h>
+    #include "windows.h"
+	#pragma warning(disable: 4005)
+	#include <ntstatus.h>
+	#pragma warning(default: 4005)
+ 	#include <winternl.h>
+	#include <tlhelp32.h>
+	#include <cstdlib> 
+	#include "%<modelName>.h"              // Model's header file
+	#include "rtwtypes.h"                  // MathWorks types
+	%if extMode == 1
+	#include "ext_work.h"                  // External mode header file
+	#include <intrin.h>
+	%endif
+	/* **************************************************************************** */
+	
+	
+	
+	/* ******************************** Defines *********************************** */
+	#ifndef TRUE
+	#define TRUE true
+	#define FALSE false
+	#endif
+
+    //!  ==================*
+    //! * Required defines *
+    //! *==================*/
+
+	#ifndef MODEL
+	# error Must specify a model name.  Define MODEL=name.
+	#else
+	// create generic macros that work with any model
+	# define EXPAND_CONCAT(name1,name2) name1 ## name2
+	# define CONCAT(name1,name2) EXPAND_CONCAT(name1,name2)
+	# define MODEL_INITIALIZE CONCAT(MODEL,_initialize)
+	# define MODEL_STEP       CONCAT(MODEL,_step)
+	# define MODEL_TERMINATE  CONCAT(MODEL,_terminate)
+	# define RT_MDL           CONCAT(MODEL,_M)
+	#endif
+	/* **************************************************************************** */
+	
+	
+	
+	
+	
+	/* ************************** Realtime functions ****************************** */
+	BOOL RealTimePriorityClass()
+	{
+		return SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
+	}
+
+	BOOL RealTimeThreadPriority()
+	{
+		return SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+	}
+	/* **************************************************************************** */
+	 
+	typedef NTSTATUS (NTAPI* pSetTimerResolution)(ULONG RequestedResolution, BOOLEAN Set, PULONG ActualResolution);
+	typedef NTSTATUS (NTAPI* pQueryTimerResolution)(PULONG MinimumResolution, PULONG MaximumResolution, PULONG CurrentResolution);
+	
+	/* ***************************** Timer function ******************************* */
+	HANDLE timer;	  
+	LARGE_INTEGER li;
+
+	
+	DWORD WINAPI nanosleep(LPVOID arg){
+		wprintf(L"The nanosleep() thread ID is %u\n", GetCurrentThreadId());
+		timer = CreateWaitableTimer(NULL, TRUE, NULL);
+
+    }	
+	/* **************************************************************************** */
+	
+	
+	
+	/* *************************** TSC timestamp function ************************* */
+	LONGLONG rdtsc(){
+		return __rdtsc();
+	}
+	/* **************************************************************************** */
+	
+	
+	
+	/* ******************* Signal handler for ABORT during simulation ************* */
+	void abortHandler(int sig) {
+		fprintf(stderr, "Simulation aborted by pressing CTRL+C\n");
+		rtmSetStopRequested(%<modelName>_M, 1);
+	}
+	/* **************************************************************************** */
+
+	
+	//!
+	//! Thread handle of the base rate thread.
+	//! Fundamental sample time = %<fundamentalStepSize>s
+	//!
+	/* ***************************** Global Variables ***************************** */
+	double dTimeDiff, StartTime, ActualTime, NextTime ;
+	LONGLONG g_Frequency, g_CurrentCount, g_LastCount ;
+	LPCTSTR extMode_semaphore = "extMode_semaphore";
+	LONG SemCount = 0;
+	LARGE_INTEGER freqcounter ;
+	NTSTATUS status;
+	pSetTimerResolution setFunction;
+	pQueryTimerResolution queryFunction;
+	ULONG minResolution, maxResolution, actualResolution;
+	/* **************************************************************************** */
+	
+	
+	
+	/* *************************** Sub Rate Declarations ************************* */
+	// Thread handles of the sub rates and semaphores for sub rate threads. The array
+	// is indexed by TID, i.e. the first one or two elements are unused.
+	%foreach i = numSampleTimes
+		%if i == 0 || i == 1 && tid01Eq
+		%continue
+	%endif
+	%assign s = sampleTime%<i>
+	%assign o = offset%<i>
+	// TID%<i>: sample time = %<s>s, offset = %<o>s
+	%endforeach
+	
+	
+	struct sub_rate {
+	HANDLE thread;
+	HANDLE    sem;
+	} sub_rate[%<numSampleTimes>];
+	//! Flag if the simulation has been terminated.
+	//!
+	int simulationFinished = 0;
+	/* **************************************************************************** */
+
+	
+	
+	
+	/* ***************************** ext mode Handle ****************************** */
+	%if extMode == 1
+	// Indication that the base rate thread has started
+	HANDLE ext_mode_ready;
+	%endif
+	
+%endfunction 
+// End of function generateDeclarations
+
+
+
+
+	/* **************************** Debug function ******************************** */
+%function printfunc() Output
+	 //printf("%s\n", __func__); 
+%endfunction
+	/* **************************************************************************** */
+
+	
+	
+	/* ********************************** sub rates ******************************** */
+	// Start of function to generate all sub rate functions
+%function generateRtOneStep() Output 
+  %foreach j = numSampleTimes - 1
+    %assign i = j + 1
+    %if i == 1 && tid01Eq
+      %continue
+    %endif
+	
+LPCTSTR sub_rate_%<i>_semaphore = "sub_rate_%<i>_semaphore";
+
+DWORD WINAPI sub_rate%<i>(LPVOID arg)
+    {
+		wprintf(L"The sub_rate%<i>() thread ID is %u\n", GetCurrentThreadId());
+		if (!RealTimeThreadPriority())return -1;
+		sub_rate[%<i>].sem = OpenSemaphore(SYNCHRONIZE | SEMAPHORE_MODIFY_STATE, FALSE, sub_rate_%<i>_semaphore);
+        while(!simulationFinished) {
+			setFunction(maxResolution, TRUE, &actualResolution);
+            WaitForSingleObject(sub_rate[%<i>].sem,INFINITE);    // sem_val = 1
+            %<printfunc()>													  
+            %<modelName>_step%<i>();
+            WaitForSingleObject(sub_rate[%<i>].sem,INFINITE);    // sem_val = 0
+			
+        }
+        return NULL;
+    }
+  %endforeach
+%endfunction
+	/* **************************************************************************** */
+
+	
+	
+	/* ******************************** base rate ********************************* */
+%% GENERATEMAIN
+%%  This function generates code of the base rate function and main function.
+%%
+%function generateMain() Output
+//!
+//! This is the thread function of the base rate loop.
+//! Fundamental sample time = %<fundamentalStepSize>s
+//!
+DWORD WINAPI base_rate(LPVOID arg)
+{
+
+	wprintf(L"The base_rate() thread ID is %u\n", GetCurrentThreadId());
+	if (!RealTimeThreadPriority())return -1;
+    %assign nsec = FEVAL("uint32", (fundamentalStepSize - FEVAL("floor", fundamentalStepSize))*10000000)
+	if (!QueryPerformanceFrequency((LARGE_INTEGER*)&g_Frequency))return -1; // Get Processor Frequency
+	boolean_T eventFlags[%<numSampleTimes>];             // Model has %<numSampleTimes> rates
+	int_T taskCounter[%<numSampleTimes>] = %<FcnInitializeTaskCounter()>;
+	int_T OverrunFlags[%<numSampleTimes>];
+	int step_sem_value ;
+	int_T i;
+	
+
+	%if extMode == 1
+		%<SLibGenERTExtModeInit()>
+		HANDLE ext_mode_ready = OpenSemaphore(SYNCHRONIZE | SEMAPHORE_MODIFY_STATE, FALSE, extMode_semaphore);
+		ReleaseSemaphore(ext_mode_ready,1,NULL);
+	%endif
+		QueryPerformanceCounter((LARGE_INTEGER*)&g_CurrentCount);
+		// Main loop, running until all the threads are terminated
+		while(rtmGetErrorStatus(%<modelName>_M) == NULL && !rtmGetStopRequested(%<modelName>_M)) {
+			StartTime= QueryPerformanceCounter((LARGE_INTEGER*)&g_CurrentCount);
+			//ActualTime = 100000000*(double)g_CurrentCount/(double)g_Frequency;  // Timekeeping over QueryPerformanceCounter()
+			ActualTime = (((double)rdtsc()/(double)g_Frequency));				  // Timekeeping over rdtsc()
+			%<printfunc()>
+			
+			// Check subrate overrun, set rates that need to run this time step
+		%foreach i = numSampleTimes
+		%if i == 0 || i == 1 && tid01Eq
+			%continue
+		%endif           
+            if (taskCounter[%<i>] == 0) {
+              if (eventFlags[%<i>]) {
+                OverrunFlags[0] = false;
+                OverrunFlags[%<i>] = true;
+
+				// Sampling too fast
+				rtmSetErrorStatus(%<modelName>_M, "Overrun");
+                return 0;
+				}
+													  
+
+              eventFlags[%<i>] = true;
+            }					
+
+            %assign T = FEVAL("int32", FEVAL("floor", sampleTime%<i> / fundamentalStepSize))
+            taskCounter[%<i>]++;
+            if (taskCounter[%<i>] == %<T>) {
+              taskCounter[%<i>]= 0; 
+					   
+												  
+            }
+        %endforeach
+
+			
+			
+ 		// Trigger sub-rate threads
+		%foreach i = numSampleTimes
+			%if i == 0 || i == 1 && tid01Eq
+		%continue
+		%endif
+		%assign s = sampleTime%<i>
+		%assign o = offset%<i>
+		// Sampling rate %<i>, sample time = %<s>, offset = %<o>
+		if (eventFlags[%<i>]) {
+			
+
+			eventFlags[%<i>] = FALSE;
+			
+			
+			if (ReleaseSemaphore(sub_rate[%<i>].sem,0,&SemCount)!=0) {
+				rtmSetErrorStatus(%<modelName>_M, "Overrun"); 
+				printf("Sub rate %<i> overrun, sample time=%<s>s, offset=%<o>s is too fast\n");
+				break;
+			}
+			
+			if(SemCount !=0){
+				rtmSetErrorStatus(%<modelName>_M, "Overrun"); 
+				printf("Sub rate %<i> overrun, sample time=%<s>s, offset=%<o>s is too fast\n");
+				break;
+			}
+			ReleaseSemaphore(sub_rate[%<i>].sem,2,&SemCount);
+			}	
+		%endforeach
+
+		// Execute base rate step 
+		%if solverMode == "SingleTasking"
+			%<modelName>_step();
+		%else
+			%<modelName>_step0();
+		%endif
+		%if extMode == 1
+		rtExtModeCheckEndTrigger();
+		%endif
+
+
+        do {
+			
+
+			QueryPerformanceCounter((LARGE_INTEGER*)&g_LastCount);
+			//NextTime = 100000000*((double)g_LastCount)/(double)g_Frequency; 			// Timekeeping over QueryPerformanceCounter()
+			NextTime = (((double)rdtsc()/(double)g_Frequency));							// Timekeeping over rdtsc()
+			
+			//Checking Base_rate Overrun 
+			if (%<nsec>-((NextTime-ActualTime)*10000) < 0) {
+                    printf("Base rate (%<fundamentalStepSize>s) overrun \n");
+                    continue;
+			}
+		}while (0);
+
+		setFunction(maxResolution, TRUE, &actualResolution);
+		
+		// Calculating sleeptime
+		double sleeptime = %<nsec> -((NextTime-ActualTime)*10000);
+		li.QuadPart = -sleeptime;
+		
+		// Opening Waitable timer nanosleep
+		SetWaitableTimer(timer, &li, 0, NULL, NULL, 0);
+		setFunction(maxResolution, TRUE, &actualResolution);
+		
+		// Waiting for timer to finish
+		WaitForSingleObject(timer, INFINITE);
+		
+		
+		
+	}	
+	simulationFinished = 1;
+	// Final step for sub rate step functions
+	for (i = %<1 + tid01Eq>; i < %<numSampleTimes>; i++) {
+		ReleaseSemaphore(sub_rate[i].sem,2,&SemCount);
+		
+	}
+}// end of function void * base_rate()
+	/* **************************************************************************** */
+
+
+	
+	/* ***************************** main function ******************************** */
+//!
+//! This is the main function of the model.
+//! Multirate - Multitasking case main file
+//!
+int_T main(int_T argc, const char_T *argv[])
+{
+	
+	const HINSTANCE hLibrary = LoadLibrary("NTDLL.dll");
+	if (hLibrary == NULL)
+	{
+		printf("Failed to load NTDLL.dll (%d)\n", GetLastError());
+		return 1;
+	}
+
+	queryFunction = (pQueryTimerResolution)GetProcAddress(hLibrary, "NtQueryTimerResolution");
+	if (queryFunction == NULL)
+	{
+		printf("NtQueryTimerResolution is null (%d)\n", GetLastError());
+		return 1;
+	}
+
+	queryFunction(&minResolution, &maxResolution, &actualResolution);
+	printf("Win32 Timer Resolution:\n\tMinimum Value:\t%u\n\tMaximum Value:\t%u\n\tActual Value:\t%u\n\n", minResolution, maxResolution, actualResolution);
+
+	setFunction = (pSetTimerResolution)GetProcAddress(hLibrary, "NtSetTimerResolution");
+	if (setFunction == NULL)
+	{
+		printf("NtSetTimerResolution is null (%d)\n", GetLastError());
+		return 1;
+	}
+	printf("Setting Timer Resolution to the maximum value (%d)...\n", maxResolution);
+	status = setFunction(maxResolution, TRUE, &actualResolution);
+	if (status == STATUS_SUCCESS)
+	{
+		printf("Success! (Current resolution: %d)\n\n", actualResolution);
+		
+	}
+
+	if (status == STATUS_TIMER_RESOLUTION_NOT_SET)
+	{
+		printf("Timer not set (Return Code: %d)\n", status);
+		return 2;
+	} 
+
+	const char_T *errStatus;
+	int_T i;
+		
+	// Some info over the generated Threads
+	wprintf(L"The main() process ID is %u\n", GetCurrentProcessId());
+	wprintf(L"The main() thread ID is %u\n", GetCurrentThreadId());
+	wprintf(L"\n");
+	
+		
+	if(!RealTimePriorityClass())return -1;
+	
+	%if extMode == 1
+		// External mode
+		signal(SIGINT, abortHandler); // important for letting the destructor be called.
+        rtParseArgsForExtMode(argc, argv);
+		CreateSemaphore(NULL,0,1,extMode_semaphore);
+	%else
+		(void)(argc);
+		(void *)(argv);
+	%endif
+
+    
+
+		// Initialize model
+	%<modelName>_initialize();
+		simulationFinished = 0;
+    // Prepare task attributes */
+
+	%foreach i = numSampleTimes
+			%if i == 0 || i == 1 && tid01Eq
+				%continue
+			%endif
+      %assign s = sampleTime%<i>
+      %assign o = offset%<i>
+	// Initializing the step semaphore of the loop %<i> */
+	CreateSemaphore(NULL,0,2,sub_rate_%<i>_semaphore);
+
+	// Starting loop %<i> thread for sample time = %<s>s, offset = %<o>s.
+	CreateThread(NULL,0,sub_rate%<i>,(LPVOID)NULL,0,NULL);
+		
+		
+		
+	%endforeach
+	// Starting the nanosleep function
+	CreateThread(NULL,0,nanosleep,(LPVOID)NULL,0,NULL);
+	// Starting the base rate thread
+	CreateThread(NULL,0,base_rate,(LPVOID)NULL,0,NULL);
+
+
+	if (!RealTimeThreadPriority())return -1;
+
+	
+	
+		%if extMode == 1
+			// External mode
+			WaitForSingleObject(ext_mode_ready,INFINITE);
+			while(rtmGetErrorStatus(%<modelName>_M) == NULL && !rtmGetStopRequested(%<modelName>_M)) {
+				rtExtModeOneStep(%<modelName>_M->extModeInfo, NUMST, (boolean_T *)&rtmGetStopRequested(RT_MDL));
+				Sleep(%<FEVAL("uint32", fundamentalStepSize * 1000)>);
+			}
+		%endif
+
+		// Wait for threads to finish
+		%foreach i = numSampleTimes
+			%if i == 0 || i == 1 && tid01Eq
+				%continue
+			%endif
+           
+			
+		%endforeach
+
+		%if extMode == 1
+			rtExtModeShutdown(%<numSampleTimes>);
+		%endif
+		// Terminate model
+		%<modelName>_terminate();
+	errStatus = rtmGetErrorStatus(%<modelName>_M);
+	if(errStatus != NULL && strcmp(errStatus, "Simulation finished")) {
+		%%printf("%s\n", rtmGetErrorStatus(%<modelName>_M));
+		if(!strcmp(errStatus, "Overrun")) {
+			printf("ISR overrun - sampling rate too fast\n");
+		}
+		return(1);
+    }
+		CancelWaitableTimer(timer);    // Stop timer
+		CloseHandle(timer); 			// Delete handle
+        return 0;
+    }
+// Local Variables:
+// compile-command: "make -f %<modelName>.mk"
+// End:
+%endfunction
+	/* **************************************************************************** */
